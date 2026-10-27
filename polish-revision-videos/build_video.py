@@ -1,14 +1,15 @@
-"""Build the Polish A1 revision video from the lesson script in content.py.
+"""Build a Polish revision video from a lesson script (content_a1/content_a2).
 
 Pipeline: synthesise narration (RHVoice) -> lay out a timeline -> render one
 slide per reveal step (Pillow) -> mux with ffmpeg (chapters + loudness norm).
 
-Usage: python3 build_video.py [--out DIR] [--no-video]
+Usage: python3 build_video.py --level a2 [--out DIR] [--no-video]
 """
 
 import argparse
 import functools
 import hashlib
+import importlib
 import math
 import re
 import subprocess
@@ -19,8 +20,6 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-
-import content
 
 W, H = 1280, 720
 SR = 24000
@@ -36,6 +35,7 @@ VOICES = {
     'pl': ('magda', 90),
     'ps': ('magda', 68),
     'nt': ('natan', 90),
+    'ns': ('natan', 70),
 }
 
 COLORS = {
@@ -249,7 +249,15 @@ def wrap(text, style, size, width):
     return lines + [cur] if cur else lines
 
 
-KIND_H = {'card': 80, 'pair': 66, 'conj': 58, 'rule': 66, 'head': 34, 'list': 56}
+KIND_H = {
+    'card': 80,
+    'card2': 92,
+    'pair': 66,
+    'conj': 58,
+    'rule': 66,
+    'head': 34,
+    'list': 56,
+}
 CARD_W = {
     'card': [0.34, 0.33, 0.33],
     'pair': [0.5, 0.5],
@@ -349,6 +357,16 @@ def draw_row(draw, row, y, hot, accent, shared=None):
         for idx, (box, txt, (sty, size, colour)) in enumerate(cells):
             tint = COLORS[row['col']] if row.get('col') and idx == 0 else colour
             draw_text(draw, box, txt, sty, size, tint)
+    elif kind == 'card2':
+        inner = right - left - 36
+        split = inner * (row.get('w') or [0.58])[0]
+        pol, phon, eng = row['c']
+        tint = COLORS[row['col']] if row.get('col') else WHITE
+        draw_text(draw, (left + 18, y + 30, split - 12), pol, 'b', 34, tint)
+        draw_text(draw, (left + 18, y + 64, split - 12), phon, 'i', 25, COLORS['a'])
+        draw_text(
+            draw, (left + 18 + split, ymid, inner - split - 12), eng, 'r', 26, SOFT
+        )
     elif kind == 'list':
         n = len(row['c'])
         for box, txt in zip(cell_boxes(ymid, [1 / n] * n), row['c']):
@@ -390,7 +408,7 @@ def mmss(sec):
     return f'{int(sec) // 60}:{int(sec) % 60:02d}'
 
 
-def render(frame, scenes, total, chapters):
+def render(frame, scenes, total, chapters, label):
     """Render one frame to a PIL image."""
     scene = scenes[frame.scene]
     accent = COLORS[scene.accent]
@@ -438,7 +456,7 @@ def render(frame, scenes, total, chapters):
         draw.line((tx, bar_y - 3, tx, bar_y + 11), fill=(120, 140, 180), width=2)
     draw.text(
         (PAD_X, H - 12),
-        'Polish A1 revision',
+        f'{label} revision',
         font=font('r', 16),
         fill=MUTED,
         anchor='lm',
@@ -465,16 +483,16 @@ def write_wav(path, arr):
         wav.writeframes(pcm.tobytes())
 
 
-def write_chapters(path, chapters):
+def write_chapters(path, chapters, title):
     """ffmetadata with one CHAPTER block per scene."""
-    lines = [';FFMETADATA1', 'title=Polish A1 - full revision', 'artist=Claude']
-    for title, start, end in chapters:
+    lines = [';FFMETADATA1', f'title={title} - full revision', 'artist=Claude']
+    for name, start, end in chapters:
         lines += [
             '[CHAPTER]',
             'TIMEBASE=1/1000',
             f'START={int(start * 1000)}',
             f'END={int(end * 1000) - 1}',
-            f'title={title}',
+            f'title={name}',
         ]
     path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
@@ -484,9 +502,9 @@ def strip(text):
     return TOKEN.sub(lambda m: m.group(2), text)
 
 
-def write_cheat_sheet(path, scenes):
+def write_cheat_sheet(path, scenes, title):
     """Dump every on-screen row to a markdown revision sheet."""
-    out = ['# Polish A1 - revision cheat sheet', '']
+    out = [f'# {title} - revision cheat sheet', '']
     for scene in scenes:
         if scene.cover:
             continue
@@ -569,23 +587,29 @@ def mux(plan, audio_path, out_dir, meta_path, mp4_path):
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--level', default='a1', choices=['a1', 'a2'])
     parser.add_argument('--out', default='build', help='working/output directory')
     parser.add_argument('--no-video', action='store_true', help='audio + timing only')
     args = parser.parse_args()
 
-    out_dir = Path(args.out).resolve()
-    cache = out_dir / 'audio_cache'
+    lesson = importlib.import_module(f'content_{args.level}')
+    title, slug = lesson.META['title'], lesson.META['slug']
+    root = Path(args.out).resolve()
+    out_dir = root / args.level
+    cache = root / 'audio_cache'
     frames_dir = out_dir / 'frames'
     for folder in (cache, frames_dir):
         folder.mkdir(parents=True, exist_ok=True)
+    for stale in frames_dir.glob('*.png'):
+        stale.unlink()
 
-    scenes = content.SCENES
+    scenes = lesson.SCENES
     print(f'synthesised {prefetch(scenes, cache)} unique segments')
     plan = build_plan(scenes, cache)
     total = sum(f.dur for f in plan.frames)
     print(f'total duration: {mmss(total)} ({total:.1f}s), {len(plan.frames)} frames')
-    for title, start, end in plan.chapters:
-        print(f'  {mmss(start)}  {end - start:6.1f}s  {title}')
+    for name, start, end in plan.chapters:
+        print(f'  {mmss(start)}  {end - start:6.1f}s  {name}')
     if args.no_video:
         return
 
@@ -593,7 +617,7 @@ def main():
     for idx, frame in enumerate(plan.frames):
         frame.path = frames_dir / f'f{idx:04d}.png'
         try:
-            render(frame, scenes, total, plan.chapters).save(frame.path)
+            render(frame, scenes, total, plan.chapters, title).save(frame.path)
         except ValueError as err:
             problems.append(f'frame {idx} @ {mmss(frame.start)}: {err}')
     if problems:
@@ -601,9 +625,9 @@ def main():
     audio_path = out_dir / 'narration.wav'
     write_wav(audio_path, np.concatenate(plan.audio))
     meta_path = out_dir / 'chapters.txt'
-    write_chapters(meta_path, plan.chapters)
-    write_cheat_sheet(out_dir / 'polish_a1_cheat_sheet.md', scenes)
-    mp4_path = out_dir / 'polish_a1_revision.mp4'
+    write_chapters(meta_path, plan.chapters, title)
+    write_cheat_sheet(out_dir / f'{slug}_cheat_sheet.md', scenes, title)
+    mp4_path = out_dir / f'{slug}_revision.mp4'
     mux(plan, audio_path, out_dir, meta_path, mp4_path)
     print(f'wrote {mp4_path}')
 
